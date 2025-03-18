@@ -41,29 +41,25 @@ class AdvancedSelfLearning:
         self.sequence_length = sequence_length
         self.ohlcv_features = ohlcv_features
         self.order_book_levels = order_book_levels
-        self.order_book_features = 2 * (2 * order_book_levels)  # Price + Size for bids and asks
+        self.order_book_features = 2 * (2 * order_book_levels)
         self.prediction_steps = prediction_steps
 
-        # Scalers
         self.scaler_ohlcv = MinMaxScaler(feature_range=(-1, 1))
         self.scaler_order_book = MinMaxScaler(feature_range=(-1, 1))
         self.is_scaler_fitted = {'ohlcv': False, 'order_book': False}
 
-        # Ensure model directory
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
 
-        # RL (Double DQN)
         self.memory = deque(maxlen=20000)
         self.gamma = 0.95
-        self.epsilon = 1.0
+        self.epsilon = 0.5  # Adjusted for faster exploitation
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.99  # Faster decay
         self.batch_size = 64
-        self.target_update_freq = 100  # Steps to update target network
+        self.target_update_freq = 100
         self.steps = 0
 
-        # Trade tracking
-        self.current_position = None  # (side, entry_price, qty, timestamp)
+        self.current_position = None
         self.profit_target = 0.03
         self.stop_loss = 0.015
         self.trailing_stop = 0.01
@@ -73,10 +69,10 @@ class AdvancedSelfLearning:
         self.total_trades = 0
         self.trade_history = deque(maxlen=1000)
 
-        # Models
         self.model = self._load_or_build_model()
-        self.target_model = self._load_or_build_model()  # For Double DQN
+        self.target_model = self._load_or_build_model()
         self.target_model.set_weights(self.model.get_weights())
+        self._pretrain_model()
 
     def _load_or_build_model(self) -> Model:
         try:
@@ -121,11 +117,27 @@ class AdvancedSelfLearning:
         model.compile(optimizer=Adam(learning_rate=0.0005), loss='huber')
         return model
 
+    def _pretrain_model(self):
+        if not os.path.exists(self.model_path):
+            ohlcv_data = self.api.get_historical_data("BTCUSDT", limit=500)
+            order_book = self.api.get_order_book("BTCUSDT")
+            states_ohlcv = self._preprocess_ohlcv(ohlcv_data[-500:])
+            states_ob = self._preprocess_order_book(order_book)
+            dummy_targets = np.zeros((1, 3))
+            self.model.fit(
+                {'ohlcv_input': states_ohlcv[np.newaxis, :], 'order_book_input': states_ob[np.newaxis, :]},
+                dummy_targets,
+                epochs=50,
+                verbose=0
+            )
+            self.model.save(self.model_path)
+            logger.info("Model pretrained with 500 data points")
+
     def _preprocess_ohlcv(self, data: np.ndarray) -> np.ndarray:
         try:
-            if data.shape[1] != self.ohlcv_features + 1:  # +1 for timestamp
+            if data.shape[1] != self.ohlcv_features + 1:
                 raise ValueError(f"OHLCV data expected {self.ohlcv_features + 1} columns, got {data.shape[1]}")
-            prices = data[-self.sequence_length:, 1:6]  # Exclude timestamp
+            prices = data[-self.sequence_length:, 1:6]
             if not self.is_scaler_fitted['ohlcv']:
                 normalized = self.scaler_ohlcv.fit_transform(prices)
                 self.is_scaler_fitted['ohlcv'] = True
@@ -200,7 +212,6 @@ class AdvancedSelfLearning:
             logger.error(f"Replay failed: {str(e)}")
 
     def predict_action(self, analysis: Dict, position: Optional[Dict], balance: float) -> str:
-        """Predict action based on analysis from main.py."""
         try:
             ohlcv_state = self.api.get_historical_data("BTCUSDT", limit=self.sequence_length)
             order_book_state = self.api.get_latest_order_book()
@@ -215,7 +226,14 @@ class AdvancedSelfLearning:
                 action = random.randint(0, 2)
             else:
                 q_values = self.model.predict([ohlcv_processed[np.newaxis, :], ob_processed[np.newaxis, :]], verbose=0)[0]
-                action = np.argmax(q_values)
+                threshold = volatility * current_price * 0.005
+                if q_values[0] - q_values[2] > threshold:
+                    action = 0
+                elif q_values[1] - q_values[2] > threshold:
+                    action = 1
+                else:
+                    action = 2
+                logger.debug(f"Q-values: {q_values}, Threshold: {threshold}, Action: {action}")
 
             actions = ["BUY", "SELL", "HOLD"]
             action_str = actions[action]
@@ -224,13 +242,13 @@ class AdvancedSelfLearning:
                 self.current_position = (position['side'].capitalize(), position['entry_price'], position['size'], time.time())
                 position_action = self.manage_position(current_price)
                 if position_action == "CLOSE":
-                    return "BUY" if self.current_position[0] == "Sell" else "SELL"  # Close short with BUY, long with SELL
+                    return "BUY" if self.current_position[0] == "Sell" else "SELL"
                 return "HOLD"
 
-            # Risk-adjusted decision
             risk_amount = balance * (self.max_risk_percent / 100)
-            size = min(risk_amount / (current_price * volatility), 0.1)  # Cap at 0.1 BTC
-            if size < 0.001:
+            size = min(risk_amount / (current_price * volatility), 0.1)
+            size = max(size, 0.001)
+            if size > 0.1:
                 return "HOLD"
 
             return action_str
@@ -245,6 +263,7 @@ class AdvancedSelfLearning:
             self.current_position = (side, entry_price, qty, time.time())
             self.total_trades += 1
             self.trade_history.append({"side": side, "entry_price": entry_price, "qty": qty, "timestamp": time.time()})
+            logger.info(f"Trade opened: {side} {qty} @ {entry_price}")
 
     def clear_trade_state(self, exit_price: float) -> float:
         if not self.current_position:
@@ -258,6 +277,7 @@ class AdvancedSelfLearning:
             else:
                 self.loss_count += 1
             self.trade_history.append({"exit_price": exit_price, "profit": profit, "timestamp": time.time()})
+            logger.info(f"Trade closed: Profit {profit}, Total Trades: {self.total_trades}")
             self.current_position = None
             return reward
         except Exception as e:
@@ -269,12 +289,13 @@ class AdvancedSelfLearning:
             return "HOLD"
         side, entry_price, _, _ = self.current_position
         profit = (current_price - entry_price) / entry_price if side == "Buy" else (entry_price - current_price) / entry_price
-        if profit >= self.profit_target or profit <= -self.stop_loss:
+        dynamic_profit_target = max(self.profit_target * self.api.get_historical_data("BTCUSDT", limit=50)[-1, 3] * 0.01, 0.02)
+        dynamic_stop_loss = min(self.stop_loss * self.api.get_historical_data("BTCUSDT", limit=50)[-1, 3] * 0.01, 0.01)
+        if profit >= dynamic_profit_target or profit <= -dynamic_stop_loss:
             return "CLOSE"
         return "HOLD"
 
     def train_episode(self, analysis: Dict, position: Optional[Dict], balance: float):
-        """Train the model with a single episode."""
         try:
             ohlcv_data = self.api.get_historical_data("BTCUSDT", limit=self.sequence_length)
             order_book_data = self.api.get_latest_order_book()
@@ -307,6 +328,7 @@ class AdvancedSelfLearning:
 
             self.store_experience(state, action_idx, reward, next_state, done)
             self.replay()
+            self.save_model()
             logger.info("Self-learning episode completed successfully")
         except Exception as e:
             logger.error(f"Training episode failed: {str(e)}")

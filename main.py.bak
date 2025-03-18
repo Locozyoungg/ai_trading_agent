@@ -21,15 +21,22 @@ load_dotenv()
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('trading_bot.log', encoding='utf-8'), logging.StreamHandler()]
-)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.handlers = []
+file_handler = logging.FileHandler('trading_bot.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.INFO)
+stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 
 try:
     from bybit_client import BybitClient
+    from ai.self_learning import AdvancedSelfLearning
+    # Placeholder imports for other components (to be implemented separately)
     from risk_management.leverage_control import LeverageControl
     from risk_management.max_drawdown import MaxDrawdown
     from risk_management.max_loss import MaxLossPerTrade
@@ -50,7 +57,6 @@ try:
     from execution.scalping_strategy import ScalpingStrategy
     from tracking.profit_tracker import ProfitTracker
     from tracking.strategy_report import StrategyReport
-    from ai.self_learning import AdvancedSelfLearning
 except ImportError as e:
     logger.critical(f"Failed to import required module: {e}", exc_info=True)
     sys.exit(1)
@@ -64,14 +70,12 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 API_KEY = os.getenv('BYBIT_API_KEY')
 API_SECRET = os.getenv('BYBIT_API_SECRET')
-BYBIT_API_BASE_URL = os.getenv('BYBIT_API_BASE_URL')
 TESTNET = os.getenv('USE_TESTNET', 'True').lower() == 'true'
 SYMBOL_BTC = os.getenv('SYMBOL_BTC', 'BTCUSDT')
 TRADE_SIZE_BTC = float(os.getenv('TRADE_SIZE_BTC', '0.01'))
 MAX_POSITION_BTC = float(os.getenv('MAX_POSITION_BTC', '0.1'))
 INITIAL_BALANCE = float(os.getenv('INITIAL_BALANCE', '1000.0'))
 RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.02'))
-MARKET_CATEGORY = os.getenv('MARKET_CATEGORY', 'linear')
 
 if not API_KEY or not API_SECRET:
     raise ValueError("API credentials missing!")
@@ -104,22 +108,24 @@ class TradingSystem:
         self.tracking_components = {}
         self.learning_components = {}
         self.last_report_time = time.time()
-        self.report_interval = 3600  # 1 hour in seconds
+        self.report_interval = 3600
         self.last_position_sync_time = 0
-        self.position_sync_interval = 300  # Sync positions every 5 minutes
+        self.position_sync_interval = 60
+        self.monitor_thread = None
         try:
             self.client.start_websocket()
             self._sync_open_positions()
             self._initialize_components()
             self.running = True
-            Thread(target=self._monitor_market, daemon=True).start()
+            self.monitor_thread = Thread(target=self._monitor_market, daemon=True)
+            self.monitor_thread.start()
             logger.info("TradingSystem initialized with multi-threaded AI capabilities")
         except Exception as e:
             logger.error(f"Initialization failed: {str(e)}", exc_info=True)
             self.running = False
 
     def _initialize_components(self):
-        logger.debug("Initializing risk management, analysis, trading, execution, tracking, and learning components")
+        logger.debug("Initializing components")
         self.initial_balance = self.client.get_balance() or self.initial_balance
         self.current_balance = self.initial_balance
         self.risk_components = self._initialize_risk_management()
@@ -142,7 +148,6 @@ class TradingSystem:
             'stop_loss': StopLossTakeProfit(self.client),
             'trailing_stop': TrailingStopLoss(self.client)
         }
-        logger.info("Risk management components initialized")
         return components
 
     def _initialize_analysis_tools(self) -> Dict:
@@ -156,7 +161,6 @@ class TradingSystem:
             'stop_hunt_detector': StopHuntDetector(self.client, self.symbol),
             'market_insights_1h': MarketInsights(self.client, [self.symbol], timeframe='1h'),
         }
-        logger.info("Analysis tools initialized")
         return components
 
     def _initialize_trading_strategy(self) -> AdvancedTradingStrategy:
@@ -174,7 +178,6 @@ class TradingSystem:
             take_profit_factor=0.03,
             lstm_sequence_length=60
         )
-        logger.info("Trading strategy initialized")
         return strategy
 
     def _initialize_tracking_components(self) -> Dict:
@@ -183,7 +186,6 @@ class TradingSystem:
             'profit_tracker': ProfitTracker(self.client, self.symbol),
             'strategy_report': StrategyReport(self.client)
         }
-        logger.info("Tracking components initialized")
         return components
 
     def _initialize_learning_components(self) -> Dict:
@@ -196,7 +198,6 @@ class TradingSystem:
                     sequence_length=50
                 )
             }
-            logger.info("Learning components initialized")
             return components
         except Exception as e:
             logger.error(f"Self-learning initialization failed: {str(e)}", exc_info=True)
@@ -211,14 +212,13 @@ class TradingSystem:
             'scalping': ScalpingStrategy(self.client, self.symbol, **common_args),
             'default': self.trading_strategy
         }
-        logger.info("Execution strategies initialized")
 
     def _initialize_order_book_model(self):
         logger.debug("Initializing order book model")
         if not os.path.exists(self.order_book_model.model_path):
-            ohlcv_data = self.client.get_historical_data(self.symbol, limit=50)
+            ohlcv_data = self.client.get_historical_data(self.symbol, limit=200)
             order_book = self.client.get_order_book(self.symbol)
-            self.order_book_model.train(ohlcv_data, order_book, epochs=20)
+            self.order_book_model.train(ohlcv_data, order_book, epochs=50)
             logger.info("Order book model trained and initialized")
         else:
             logger.info("Order book model weights already exist. Skipping initial training")
@@ -246,7 +246,6 @@ class TradingSystem:
                     logger.debug("No open positions found")
                 self.current_balance = self.client.get_balance() or self.current_balance
                 self.last_position_sync_time = time.time()
-                logger.info(f"Current balance updated: {self.current_balance}")
         except Exception as e:
             logger.error(f"Position sync failed: {str(e)}", exc_info=True)
 
@@ -258,10 +257,8 @@ class TradingSystem:
                 logger.warning(f"Insufficient OHLCV data: {data.shape[0]} < {limit}")
                 padded = np.zeros((limit, 6))
                 padded[-data.shape[0]:] = data
-                logger.debug(f"Padded OHLCV data to {padded.shape}")
                 return padded
             self.volatility_window.append(np.std(data[:, 3]))
-            logger.info(f"Fetched {data.shape[0]} OHLCV points")
             return data
         except Exception as e:
             logger.error(f"OHLCV fetch failed: {str(e)}", exc_info=True)
@@ -276,10 +273,10 @@ class TradingSystem:
                     self._sync_open_positions()
                 self._update_and_train_model()
                 self._generate_reports()
-                time.sleep(60)
+                time.sleep(30)
             except Exception as e:
                 logger.error(f"Market monitor failed: {str(e)}", exc_info=True)
-                time.sleep(5)  # Brief pause before retrying
+                time.sleep(5)
 
     def _update_and_train_model(self):
         logger.debug("Updating and training order book model")
@@ -288,7 +285,7 @@ class TradingSystem:
             order_book = self.client.get_latest_order_book()
             ohlcv_df = pd.DataFrame(ohlcv_data[:, 1:6], columns=["open", "high", "low", "close", "volume"])
             self.order_book_model.update_data(ohlcv_df, order_book)
-            self.order_book_model.train(ohlcv_data, order_book, epochs=5)
+            self.order_book_model.train(ohlcv_data, order_book, epochs=10)
             logger.info("Model updated and retrained successfully")
         except Exception as e:
             logger.error(f"Model update/train failed: {str(e)}", exc_info=True)
@@ -333,11 +330,9 @@ class TradingSystem:
         try:
             current_time = time.time()
             if current_time - self.last_report_time < self.report_interval:
-                logger.debug("Report interval not reached. Skipping report generation")
                 return
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            # Performance Report
             perf_metrics = self.learning_components['self_learning'].get_performance_metrics()
             perf_report = (
                 f"Performance Report - {timestamp}\n"
@@ -351,12 +346,10 @@ class TradingSystem:
             )
             with open(REPORTS_DIR / f"performance_{timestamp}.txt", "w", encoding='utf-8') as f:
                 f.write(perf_report)
-            logger.debug(f"Performance report generated: {REPORTS_DIR / f'performance_{timestamp}.txt'}")
 
-            # Recommendations
             analysis = self._analyze_market_conditions()
-            preds = analysis.get('ob_prediction', [self.client.get_current_price(self.symbol)])
-            current_price = self.client.get_current_price(self.symbol)
+            preds = analysis.get('ob_prediction', [self.client.get_current_price(self.symbol) or 0])
+            current_price = self.client.get_current_price(self.symbol) or 0
             trend = "Up" if preds[-1] > current_price else "Down"
             recs = (
                 f"Recommendations - {timestamp}\n"
@@ -368,13 +361,8 @@ class TradingSystem:
             )
             with open(REPORTS_DIR / f"recommendations_{timestamp}.txt", "w", encoding='utf-8') as f:
                 f.write(recs)
-            logger.debug(f"Recommendations report generated: {REPORTS_DIR / f'recommendations_{timestamp}.txt'}")
 
-            # Signals
-            action = self.learning_components['self_learning'].predict_action(
-                self._fetch_ohlcv_data(), self.client.get_latest_order_book(),
-                current_price, self.current_balance, analysis['volatility']
-            )
+            action = self.learning_components['self_learning'].predict_action(analysis, self.position_info, self.current_balance)
             signals = (
                 f"Trading Signals - {timestamp}\n"
                 f"Action: {action}\n"
@@ -384,7 +372,6 @@ class TradingSystem:
             )
             with open(REPORTS_DIR / f"signals_{timestamp}.txt", "w", encoding='utf-8') as f:
                 f.write(signals)
-            logger.debug(f"Signals report generated: {REPORTS_DIR / f'signals_{timestamp}.txt'}")
 
             self.last_report_time = current_time
             logger.info(f"Generated reports at {REPORTS_DIR} for {timestamp}")
@@ -394,25 +381,25 @@ class TradingSystem:
     def _make_trade_decision(self, analysis: Dict):
         logger.debug(f"Making trade decision with analysis: {analysis}")
         try:
-            self._sync_open_positions()  # Ensure position data is fresh
+            self._sync_open_positions()
             current_price = self.client.get_current_price(self.symbol)
             if not current_price:
                 logger.error("Failed to fetch current price. Skipping trade decision.")
                 return
-            volatility = analysis.get('volatility', 0.01)
-            ohlcv_data = self._fetch_ohlcv_data()
-            order_book = self.client.get_latest_order_book()
 
             action = self.learning_components['self_learning'].predict_action(
-                ohlcv_data, order_book, current_price, self.current_balance, volatility
+                analysis, self.position_info, self.current_balance
             )
+            logger.info(f"Predicted action: {action}")
 
+            strategy = self.execution_strategies[self.active_strategy]
             with self.lock:
                 if self.position_info['size'] > 0:
-                    # Close position if action opposes current side
-                    if (action == "SELL" and self.position_info['side'] == 'long') or \
-                       (action == "BUY" and self.position_info['side'] == 'short'):
-                        order = self.client.close_position(self.symbol)
+                    if action in ["SELL", "BUY"] and (
+                        (action == "SELL" and self.position_info['side'] == 'long') or
+                        (action == "BUY" and self.position_info['side'] == 'short')
+                    ):
+                        order = strategy.close_position() if hasattr(strategy, 'close_position') else self.client.close_position(self.symbol)
                         if order and 'id' in order:
                             profit = self.position_info['unrealised_pnl']
                             self.trade_history.append({
@@ -422,19 +409,17 @@ class TradingSystem:
                                 "profit": profit,
                                 "timestamp": datetime.now()
                             })
-                            reward = profit / self.initial_balance
-                            self.learning_components['self_learning'].train_with_episode(
-                                ohlcv_data, [order_book], current_price, self.current_balance, volatility
-                            )
-                            logger.info(f"Closed {self.position_info['side']} position: Profit {profit}")
-                            self._sync_open_positions()  # Update position after closing
+                            reward = self.learning_components['self_learning'].clear_trade_state(current_price)
+                            self.learning_components['self_learning'].train_episode(analysis, self.position_info, self.current_balance)
+                            logger.info(f"Closed {self.position_info['side']} position: Profit {profit}, Reward {reward}")
+                            self._sync_open_positions()
                         else:
-                            logger.error("Failed to close position")
+                            logger.error(f"Failed to close position: {order}")
+                            raise RuntimeError(f"Close position failed: {order}")
                 elif action in ["BUY", "SELL"]:
-                    # Open a new position
                     size = self._calculate_dynamic_size(current_price)
                     if size > 0:
-                        order = self.client.place_order(self.symbol, size, action)
+                        order = strategy.execute_trade(action.lower(), size, current_price) if hasattr(strategy, 'execute_trade') else self.client.place_order(self.symbol, size, action)
                         if order and 'id' in order:
                             self.trade_history.append({
                                 "type": "open",
@@ -444,25 +429,25 @@ class TradingSystem:
                                 "timestamp": datetime.now()
                             })
                             self.learning_components['self_learning'].update_trade_state(action.capitalize(), current_price, size)
+                            self.learning_components['self_learning'].train_episode(analysis, self.position_info, self.current_balance)
                             logger.info(f"Opened {action.lower()} position: {size} @ {current_price}")
-                            self._sync_open_positions()  # Update position after opening
+                            self._sync_open_positions()
                         else:
-                            logger.error(f"Failed to place {action} order")
+                            logger.error(f"Failed to place {action} order: {order}")
+                            raise RuntimeError(f"Trade execution failed: {order}")
         except Exception as e:
             logger.error(f"Trade decision failed: {str(e)}", exc_info=True)
+            raise
 
     def _select_execution_strategy(self, analysis: Dict) -> str:
         logger.debug(f"Selecting execution strategy based on analysis: {analysis}")
         if analysis.get('stop_hunt'):
-            strategy = 'hft'
+            return 'hft'
         elif abs(analysis.get('ofi', 0)) > 0.3:
-            strategy = 'market_making'
+            return 'market_making'
         elif analysis.get('volatility', 0) > 0.05:
-            strategy = 'scalping'
-        else:
-            strategy = 'default'
-        logger.info(f"Selected execution strategy: {strategy}")
-        return strategy
+            return 'scalping'
+        return 'default'
 
     def _switch_strategy(self, new_strategy: str):
         logger.debug(f"Switching strategy to {new_strategy}")
@@ -481,22 +466,30 @@ class TradingSystem:
                 analysis = self._analyze_market_conditions()
                 self._switch_strategy(self._select_execution_strategy(analysis))
                 self._make_trade_decision(analysis)
-                time.sleep(15)  # High-frequency cycle
+                logger.info("Trade cycle completed")
+                time.sleep(15)
         except KeyboardInterrupt:
             logger.info("Shutting down due to keyboard interrupt...")
             self.shutdown()
         except Exception as e:
             logger.critical(f"Run error: {str(e)}", exc_info=True)
             self.shutdown()
-        finally:
-            self.shutdown()
 
     def shutdown(self):
         logger.debug("Initiating system shutdown")
         self.running = False
-        self.client.stop_websocket()
-        self._generate_reports()  # Final report on shutdown
-        logger.info("Trading system shutdown complete")
+        try:
+            self.client.stop_websocket()
+            if self.monitor_thread and self.monitor_thread.is_alive():
+                self.monitor_thread.join(timeout=5)
+                if self.monitor_thread.is_alive():
+                    logger.warning("Monitor thread did not terminate gracefully")
+            self._generate_reports()
+            logger.info("Trading system shutdown complete")
+        except Exception as e:
+            logger.error(f"Shutdown failed: {str(e)}", exc_info=True)
+        finally:
+            sys.exit(0)
 
 if __name__ == "__main__":
     trading_system = TradingSystem()
