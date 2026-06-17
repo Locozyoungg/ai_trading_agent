@@ -149,6 +149,21 @@ class BybitClient:
             logger.error(f"Order placement failed: {order}")
         return order or {}
 
+    def cancel_order(self, symbol: str, order_id: str) -> Optional[Dict]:
+        """Cancel an open order by ID.
+
+        Args:
+            symbol: Trading pair (e.g. 'BTCUSDT').
+            order_id: The exchange order ID to cancel.
+
+        Returns:
+            API response dict, or None on failure.
+        """
+        logger.debug("Cancelling order %s for %s", order_id, symbol)
+        return self.fetch_with_retry(
+            'cancel_order', symbol, order_id, params={'category': 'linear'}
+        )
+
     def get_current_price(self, symbol: str) -> float:
         ticker = self.fetch_with_retry('fetch_ticker', symbol)
         return float(ticker['last']) if ticker else 0.0

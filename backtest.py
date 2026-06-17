@@ -26,8 +26,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger('backtest')
 
-# We import the signal generator to use the same logic as live trading
-from ai.self_learning import SignalGenerator, TradeRecord
+# We import the hedge fund strategy — same engine as live trading
+from ai.self_learning import HedgeFundStrategy, TradeRecord, TradeSignal
 
 # ── Metrics ────────────────────────────────────────────────────────────────
 
@@ -111,35 +111,43 @@ class BacktestEngine:
         self,
         initial_balance: float = 1000.0,
         risk_per_trade: float = 0.01,
-        stop_loss_pct: float = 0.015,
-        take_profit_pct: float = 0.03,
         trade_size_btc: float = 0.001,
         max_position_btc: float = 0.1,
     ):
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.risk_per_trade = risk_per_trade
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
         self.trade_size = trade_size_btc
         self.max_position = max_position_btc
 
-        self.signal_gen = SignalGenerator()
+        self.strategy = HedgeFundStrategy()
         self.trades: List[Dict] = []
         self.equity_curve: List[float] = [initial_balance]
         self.returns: List[float] = []
 
-        self.position = {'size': 0.0, 'side': None, 'entry_price': 0.0}
+        self.position = {
+            'size': 0.0, 'side': None, 'entry_price': 0.0,
+            'stop_price': 0.0, 'target_price': 0.0,
+            'highest_price': 0.0, 'lowest_price': 0.0,
+            'regime': '',
+        }
         self._current_idx = 0
-        self._prices: np.ndarray = np.array([])
+        self._closes: np.ndarray = np.array([])
 
-    def _calculate_position_size(self, price: float) -> float:
-        """Simple fixed-fraction position sizing."""
+    def _calculate_position_size(self, price: float, atr: float) -> float:
+        """Position sizing using ATR-based risk distance."""
+        factor = self.strategy.get_position_sizing_factor()
+        if factor <= 0.0:
+            return 0.0
+
+        stop_distance = atr * 1.5  # 1.5× ATR stop distance
+        if stop_distance <= 0:
+            stop_distance = price * 0.01
         risk_amount = self.balance * self.risk_per_trade
-        stop_distance = price * self.stop_loss_pct
         size = risk_amount / stop_distance if stop_distance > 0 else self.trade_size
+        size *= factor
         size = min(size, self.max_position)
-        size = max(size, self.trade_size)
+        size = max(size, self.trade_size) if size > 0 else 0.0
         return size
 
     def _apply_slippage(self, price: float, is_buy: bool, slippage_bps: float = 2.0) -> float:
@@ -149,7 +157,7 @@ class BacktestEngine:
 
     def run(self, ohlcv: np.ndarray, verbose: bool = True) -> Dict:
         """
-        Run backtest on historical data.
+        Run backtest on historical data using the hedge fund strategy.
 
         Args:
             ohlcv: (N, 6) array [timestamp, open, high, low, close, volume].
@@ -158,21 +166,36 @@ class BacktestEngine:
         Returns:
             Dict of performance metrics.
         """
-        if ohlcv.shape[0] < 50:
-            logger.error("Need at least 50 candles for backtest")
+        if ohlcv.shape[0] < 60:
+            logger.error("Need at least 60 candles for backtest")
             return {}
 
-        self._prices = ohlcv[:, 4]  # close prices
+        closes = ohlcv[:, 4]
+        highs = ohlcv[:, 2]
+        lows = ohlcv[:, 3]
         volumes = ohlcv[:, 5]
+        self._closes = closes
 
-        logger.info("Running backtest on %d candles (%.1f hours)",
-                    len(self._prices), len(self._prices))
+        logger.info("Running backtest on %d candles (%.1f hours)", len(closes), len(closes))
 
-        for i in range(50, len(self._prices)):
+        warmup = 60  # need enough data for EMAs and ATR
+
+        for i in range(warmup, len(closes)):
             self._current_idx = i
-            current_price = self._prices[i]
-            lookback_prices = self._prices[:i + 1]
-            lookback_volumes = volumes[:i + 1] if len(volumes) > i else np.ones(i + 1)
+            current_price = closes[i]
+
+            # Build lookback arrays
+            lookback_closes = closes[:i + 1]
+            lookback_highs = highs[:i + 1]
+            lookback_lows = lows[:i + 1]
+            lookback_vols = volumes[:i + 1] if len(volumes) > i else np.ones(i + 1)
+
+            # Track highest/lowest since entry for trailing stop
+            if self.position['size'] > 0:
+                if self.position['side'] == 'long':
+                    self.position['highest_price'] = max(self.position['highest_price'], current_price)
+                else:
+                    self.position['lowest_price'] = min(self.position['lowest_price'], current_price)
 
             # Update equity
             unrealized = 0.0
@@ -186,41 +209,53 @@ class BacktestEngine:
             if len(self.equity_curve) > 1:
                 self.returns.append((self.equity_curve[-1] - self.equity_curve[-2]) / self.equity_curve[-2])
 
-            # Manage open position
+            # ── Manage open position ──────────────────────────────────────
             if self.position['size'] > 0:
-                self._manage_position(current_price)
+                self._manage_position(current_price, lows[i], highs[i])
                 if self.position['size'] > 0:
-                    # Check signal reversal
-                    signal = self.signal_gen.generate_signal(
-                        lookback_prices, lookback_volumes
+                    # Check signal reversal (strong opposite signal)
+                    rev_signal = self.strategy.generate_signal(
+                        lookback_closes, lookback_highs, lookback_lows, lookback_vols
                     )
-                    if self.position['side'] == 'long' and signal.strength < -0.4:
-                        self._close_position(current_price, 'signal_reversal')
-                    elif self.position['side'] == 'short' and signal.strength > 0.4:
-                        self._close_position(current_price, 'signal_reversal')
+                    if self.position['side'] == 'long' and rev_signal.action == 'sell':
+                        self._close_position(current_price, 'signal_reversal', rev_signal)
+                    elif self.position['side'] == 'short' and rev_signal.action == 'buy':
+                        self._close_position(current_price, 'signal_reversal', rev_signal)
                 continue
 
-            # No position — check for entry
-            signal = self.signal_gen.generate_signal(
-                lookback_prices, lookback_volumes
+            # ── No position — check for entry ─────────────────────────────
+            signal = self.strategy.generate_signal(
+                lookback_closes, lookback_highs, lookback_lows, lookback_vols
             )
 
-            if signal.action in ('buy', 'sell') and signal.confidence >= 0.35:
+            if signal.action in ('buy', 'sell') and signal.confidence >= 0.4:
                 action = signal.action.upper()
-                size = self._calculate_position_size(current_price)
+                size = self._calculate_position_size(current_price, self.strategy._atr(
+                    lookback_highs, lookback_lows, lookback_closes, 14
+                )[-1])
+
+                if size <= 0:
+                    continue
+
                 exec_price = self._apply_slippage(current_price, action == 'BUY')
 
                 self.position = {
                     'size': size,
                     'side': action.lower(),
                     'entry_price': exec_price,
+                    'stop_price': signal.stop_price,
+                    'target_price': signal.target_price,
+                    'highest_price': exec_price,
+                    'lowest_price': exec_price,
+                    'regime': signal.regime,
                 }
-                logger.debug("Candle %d: OPEN %s %.6f @ %.2f (conf=%.3f, regime=%s)",
-                             i, action, size, exec_price, signal.confidence, signal.regime.name)
+                logger.info("OPEN %s %s: %.6f @ %.2f | SL=%.2f TP=%.2f | %s",
+                            action, signal.regime, size, exec_price,
+                            signal.stop_price, signal.target_price, signal.rationale)
 
         # Close any remaining position
         if self.position['size'] > 0:
-            self._close_position(self._prices[-1], 'end_of_test')
+            self._close_position(self._closes[-1], 'end_of_test')
 
         # Compute and return metrics
         equity_arr = np.array(self.equity_curve)
@@ -240,30 +275,55 @@ class BacktestEngine:
 
         return metrics
 
-    def _manage_position(self, current_price: float):
-        """Apply stop-loss and take-profit."""
+    def _manage_position(self, close_price: float, low_price: float, high_price: float):
+        """Manage open position — check stops, targets, and trailing stops.
+
+        Uses the ATR-based stop/target prices stored at entry, and checks
+        intra-candle extremes to prevent gap-through.
+        """
         entry = self.position['entry_price']
-        if entry <= 0:
+        stop = self.position['stop_price']
+        target = self.position['target_price']
+        if entry <= 0 or stop <= 0:
             return
 
         if self.position['side'] == 'long':
-            pnl_pct = (current_price - entry) / entry
-            if pnl_pct <= -self.stop_loss_pct:
-                self._close_position(current_price, 'stop_loss')
-            elif pnl_pct >= self.take_profit_pct:
-                self._close_position(current_price, 'take_profit')
+            # Stop: check low against stop price (intra-candle)
+            if low_price <= stop:
+                # Fill at stop price — prevents gap-through where close is far below stop
+                self._close_position(stop, 'stop_loss')
+            # Target: check close against target
+            elif close_price >= target:
+                self._close_position(close_price, 'take_profit')
+            # Trailing stop: update stop if trailing activation threshold met
+            elif self.position['highest_price'] > entry:
+                run_pct = (self.position['highest_price'] - entry) / entry
+                if run_pct > 0.02:  # 2% profit → activate trailing
+                    trail = self.position['highest_price'] - (entry * 0.005)
+                    self.position['stop_price'] = max(self.position['stop_price'], trail)
+                    if close_price <= self.position['stop_price']:
+                        self._close_position(close_price, 'trailing_stop')
         else:
-            pnl_pct = (entry - current_price) / entry
-            if pnl_pct <= -self.stop_loss_pct:
-                self._close_position(current_price, 'stop_loss')
-            elif pnl_pct >= self.take_profit_pct:
-                self._close_position(current_price, 'take_profit')
+            # Short position
+            if high_price >= stop:
+                # Fill at stop price — prevents gap-through where close is far above stop
+                self._close_position(stop, 'stop_loss')
+            elif close_price <= target:
+                self._close_position(close_price, 'take_profit')
+            elif self.position['lowest_price'] < entry:
+                run_pct = (entry - self.position['lowest_price']) / entry
+                if run_pct > 0.02:
+                    trail = self.position['lowest_price'] + (entry * 0.005)
+                    self.position['stop_price'] = min(self.position['stop_price'], trail)
+                    if close_price >= self.position['stop_price']:
+                        self._close_position(close_price, 'trailing_stop')
 
-    def _close_position(self, price: float, reason: str):
+    def _close_position(self, price: float, exit_reason: str, signal=None):
         """Close position and record trade."""
         side = self.position['side']
         size = self.position['size']
         entry = self.position['entry_price']
+        regime = self.position.get('regime', signal.regime if signal else '')
         exec_price = self._apply_slippage(price, side == 'sell')
 
         if side == 'long':
@@ -279,23 +339,29 @@ class BacktestEngine:
             'entry_price': entry, 'exit_price': exec_price,
             'side': side, 'size': size,
             'pnl': pnl, 'pnl_pct': pnl_pct,
-            'reason': reason, 'candle_idx': self._current_idx,
+            'reason': exit_reason, 'regime': regime,
+            'candle_idx': self._current_idx,
         }
         self.trades.append(trade)
 
-        logger.debug("CLOSE %s @ %.2f | PnL: %.2f (%.2f%%) [%s]",
-                     side.upper(), exec_price, pnl, pnl_pct, reason)
+        logger.info("CLOSE %s %s: %.4f USDT (%.2f%%) [%s]", side.upper(), regime, pnl, pnl_pct, exit_reason)
 
-        self.position = {'size': 0.0, 'side': None, 'entry_price': 0.0}
+        # Reset position
+        self.position = {
+            'size': 0.0, 'side': None, 'entry_price': 0.0,
+            'stop_price': 0.0, 'target_price': 0.0,
+            'highest_price': 0.0, 'lowest_price': 0.0,
+            'regime': '',
+        }
 
-        # Feed back to signal generator
+        # Feed back to strategy for win/loss tracking
         trade_record = TradeRecord(
             entry_price=entry, exit_price=exec_price,
             side=side, size=size, pnl=pnl, pnl_pct=pnl_pct,
-            signal_strength=0.0, regime='',
+            exit_reason=exit_reason, regime=regime,
             timestamp=time.time()
         )
-        self.signal_gen.record_trade_outcome(trade_record)
+        self.strategy.record_trade_outcome(trade_record)
 
     def _print_summary(self, metrics: Dict):
         """Pretty-print backtest results."""
@@ -330,7 +396,7 @@ def fetch_historical_data(symbol: str, days: int = 30) -> Optional[np.ndarray]:
         client = BybitClient(
             os.getenv("BYBIT_API_KEY", ""),
             os.getenv("BYBIT_API_SECRET", ""),
-            testnet=False  # Use mainnet for historical data
+            testnet=True  # Use testnet (matches current API key permissions)
         )
 
         # Fetch in batches (max 200 per request)

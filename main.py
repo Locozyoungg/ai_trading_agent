@@ -64,7 +64,7 @@ from analysis.order_book_analysis import OrderBookAnalysis
 from analysis.order_timing import OrderTimingOptimizer
 from analysis.stop_hunt_detector import StopHuntDetector
 
-from ai.self_learning import SignalGenerator, TradeRecord
+from ai.self_learning import HedgeFundStrategy, TradeRecord
 
 from strategies.trading_strategy import AdvancedTradingStrategy
 
@@ -105,7 +105,7 @@ class TradingSystem:
         self.risk_components: Dict = {}
         self.analysis_components: Dict = {}
         self.trading_strategy: Optional[AdvancedTradingStrategy] = None
-        self.signal_generator: Optional[SignalGenerator] = None
+        self.signal_generator: Optional[HedgeFundStrategy] = None
         self.execution_strategies: Dict = {}
         self.tracking_components: Dict = {}
 
@@ -142,7 +142,7 @@ class TradingSystem:
         self._sync_balance()
         self.risk_components = self._init_risk()
         self.analysis_components = self._init_analysis()
-        self.signal_generator = SignalGenerator()
+        self.signal_generator = HedgeFundStrategy()
         self.trading_strategy = self._init_strategy()
         self.tracking_components = self._init_tracking()
         self._init_execution_strategies()
@@ -269,19 +269,19 @@ class TradingSystem:
 
     # ── Signal Generation ──────────────────────────────────────────────────
 
-    def _generate_signal(self, analysis: Dict) -> 'SignalResult':
-        """Generate a trading signal from all available data."""
-        # Fetch OHLCV for technical indicators
-        ohlcv = self.client.get_historical_data(self.symbol, interval='5', limit=100)
-        if ohlcv is None or len(ohlcv) < 20:
-            from ai.self_learning import SignalResult, MarketRegime
-            return SignalResult('hold', 0.0, 0.0, MarketRegime('ranging', 0, 0, False, False), {})
+    def _generate_signal(self, analysis: Dict) -> 'TradeSignal':
+        """Generate a trading signal from live market data."""
+        ohlcv = self.client.get_historical_data(self.symbol, interval='60', limit=100)
+        if ohlcv is None or len(ohlcv) < 60:
+            from ai.self_learning import TradeSignal
+            return TradeSignal('hold', 0.0, 0.0, 0.0, 'ranging', 'Warm-up')
 
-        prices = ohlcv[:, 4]   # close prices
-        volumes = ohlcv[:, 5]  # volume
-        ofi = analysis.get('ofi')
+        closes = ohlcv[:, 4]
+        highs = ohlcv[:, 2]
+        lows = ohlcv[:, 3]
+        volumes = ohlcv[:, 5]
 
-        return self.signal_generator.generate_signal(prices, volumes, ofi)
+        return self.signal_generator.generate_signal(closes, highs, lows, volumes)
 
     # ── Risk Gates ─────────────────────────────────────────────────────────
 
@@ -415,12 +415,13 @@ class TradingSystem:
                 'source': source, 'timestamp': datetime.now(),
             })
 
-            # Record in signal generator for weight adjustment
+            # Record in strategy for performance tracking
             trade_record = TradeRecord(
                 entry_price=entry_price, exit_price=price,
                 side=self.position_info['side'], size=size,
                 pnl=pnl, pnl_pct=pnl_pct,
-                signal_strength=0.0, regime='', timestamp=time.time(),
+                exit_reason='position_closed', regime='',
+                timestamp=time.time(),
             )
             if hasattr(self, 'signal_generator') and self.signal_generator:
                 self.signal_generator.record_trade_outcome(trade_record)
@@ -447,27 +448,23 @@ class TradingSystem:
 
             # 1. Generate signal
             signal = self._generate_signal(analysis)
-            logger.debug("Signal: %s (conf=%.3f, strength=%.3f, regime=%s)",
-                         signal.action, signal.confidence, signal.strength, signal.regime.name)
+            logger.debug("Signal: %s (conf=%.3f, regime=%s)",
+                         signal.action, signal.confidence, signal.regime)
 
             # 2. If in a position, check if we should close
             if self.position_info['size'] > 0:
                 # Check stop-loss / take-profit first
                 self._manage_open_position(current_price)
 
-                # If still in a position after risk management, check signal
+                # If still in a position after risk management, check signal reversal
                 if self.position_info['size'] > 0:
-                    entry_price = self.position_info['entry_price']
                     side = self.position_info['side']
-                    pnl_pct = (current_price - entry_price) / entry_price * 100 if side == 'long' \
-                              else (entry_price - current_price) / entry_price * 100
-
-                    # Close if signal strongly opposes position
-                    if side == 'long' and signal.strength < -0.5:
-                        logger.info("Signal reversal: closing long (strength=%.3f)", signal.strength)
+                    # Opposite signal is a strong reversal cue
+                    if side == 'long' and signal.action == 'sell' and signal.confidence >= 0.4:
+                        logger.info("Signal reversal: closing long")
                         self._close_position(current_price, source='signal_reversal')
-                    elif side == 'short' and signal.strength > 0.5:
-                        logger.info("Signal reversal: closing short (strength=%.3f)", signal.strength)
+                    elif side == 'short' and signal.action == 'buy' and signal.confidence >= 0.4:
+                        logger.info("Signal reversal: closing short")
                         self._close_position(current_price, source='signal_reversal')
                 return
 

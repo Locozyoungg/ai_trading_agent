@@ -10,7 +10,12 @@ import pandas as pd
 from typing import Dict, Optional, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta
-import joblib
+try:
+    import joblib
+    _HAS_JOBLIB = True
+except ImportError:
+    _HAS_JOBLIB = False
+    joblib = None
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, MultiHeadAttention, LayerNormalization, Dense, Dropout
