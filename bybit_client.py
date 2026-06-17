@@ -10,6 +10,7 @@ import logging
 import json
 import websocket
 import threading
+import ssl
 from typing import Dict, List, Optional, Tuple
 from collections import deque
 import numpy as np
@@ -72,7 +73,7 @@ class BybitClient:
         self.ws_thread = None
         self.order_book_buffer = deque(maxlen=50)
         self.trade_buffer = deque(maxlen=200)
-        self.order_book = {'bids': [], 'asks': [], 'timestamp': 0}
+        self.order_book = {'b': [], 'a': [], 'timestamp': 0}  # Adjusted keys to match self_learning.py
         self.last_update_time = 0
         self.lock = threading.Lock()
         self.ws_retries = 0
@@ -143,7 +144,7 @@ class BybitClient:
         logger.debug(f"Placing order: symbol={symbol}, qty={qty}, side={side}, order_type={order_type}, reduce_only={reduce_only}")
         order = self.fetch_with_retry('create_order', symbol, order_type.lower(), side.lower(), qty, params=params)
         if order and 'id' in order:
-            logger.info(f"Order placed: {side} {qty} {symbol} (reduce_only={reduce_only})")
+            logger.info(f"Order placed successfully: {side} {qty} {symbol} @ {price if price else 'Market'} (reduce_only={reduce_only})")
         else:
             logger.error(f"Order placement failed: {order}")
         return order or {}
@@ -169,7 +170,7 @@ class BybitClient:
             logger.info(f"No active position to close for {symbol}")
             return None
         current_side = position['side'].lower()
-        reduce_side = 'sell' if current_side == 'long' else 'buy'
+        reduce_side = 'sell' if current_side == 'buy' else 'buy'  # Adjusted to match Bybit API
         qty = float(position['contracts'])
         if qty <= 0:
             logger.warning(f"Invalid position size ({qty}) for {symbol}. Skipping close.")
@@ -202,8 +203,8 @@ class BybitClient:
         order_book = self.fetch_with_retry('fetch_order_book', symbol, limit=25, params={'category': 'linear'})
         if order_book and 'bids' in order_book and 'asks' in order_book:
             processed = {
-                'bids': order_book['bids'][:25],
-                'asks': order_book['asks'][:25],
+                'b': order_book['bids'][:25],  # Adjusted keys
+                'a': order_book['asks'][:25],
                 'timestamp': self.client.milliseconds()
             }
             with self.lock:
@@ -212,7 +213,7 @@ class BybitClient:
                 self.last_update_time = processed['timestamp']
             return processed
         logger.warning(f"Failed to fetch order book for {symbol}")
-        return {'bids': [], 'asks': [], 'timestamp': self.client.milliseconds()}
+        return {'b': [], 'a': [], 'timestamp': self.client.milliseconds()}
 
     def get_recent_trades(self, symbol: str, limit: int = 100) -> List[Dict]:
         trades = self.fetch_with_retry('fetch_trades', symbol, limit=limit, params={'category': 'linear'})
@@ -236,8 +237,8 @@ class BybitClient:
                 bids = order_data.get("b", [])[:25] or []
                 asks = order_data.get("a", [])[:25] or []
                 processed = {
-                    'bids': bids + [[0, 0]] * (25 - len(bids)) if len(bids) < 25 else bids,
-                    'asks': asks + [[0, 0]] * (25 - len(asks)) if len(asks) < 25 else asks,
+                    'b': bids + [[0, 0]] * (25 - len(bids)) if len(bids) < 25 else bids,  # Adjusted keys
+                    'a': asks + [[0, 0]] * (25 - len(asks)) if len(asks) < 25 else asks,
                     'timestamp': timestamp
                 }
                 with self.lock:
@@ -274,13 +275,13 @@ class BybitClient:
     def _retry_websocket(self):
         with self.lock:
             if self.ws_retries >= self.max_ws_retries:
-                logger.error(f"Max WebSocket retries ({self.max_ws_retries}) reached. Giving up.")
+                logger.error(f"Max WebSocket retries ({self.max_ws_retries}) reached. Falling back to REST.")
                 return
             self.ws_retries += 1
             logger.info(f"Retrying WebSocket {self.ws_retries}/{self.max_ws_retries}")
             time.sleep(self.ws_retry_delay * (2 ** (self.ws_retries - 1)))
             self.conn_manager.switch_ws_endpoint()
-            self.start_websocket()
+        self.start_websocket()
 
     def start_websocket(self):
         with self.lock:
@@ -288,7 +289,7 @@ class BybitClient:
                 logger.warning("WebSocket already running")
                 return
             if self.ws and self.ws_thread and self.ws_thread.is_alive():
-                logger.info("Closing existing WebSocket connection before starting a new one")
+                logger.info("Closing existing WebSocket before starting new one")
                 self.stop_websocket()
                 time.sleep(2)
         ws_url = self.conn_manager.get_ws_endpoint()
@@ -301,9 +302,17 @@ class BybitClient:
             on_open=self.on_open,
             header={'Host': 'stream-testnet.bybit.com' if self.testnet else 'stream.bybit.com'}
         )
-        self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+        self.ws_thread = threading.Thread(
+            target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10, sslopt={"cert_reqs": ssl.CERT_NONE}),
+            daemon=True
+        )
         self.ws_thread.start()
-        logger.info("WebSocket thread started")
+        time.sleep(2)
+        if not self.ws_connected:
+            logger.warning("WebSocket failed to connect initially")
+            self._retry_websocket()
+        else:
+            logger.info("WebSocket thread started successfully")
 
     def stop_websocket(self):
         with self.lock:
@@ -317,10 +326,11 @@ class BybitClient:
                     logger.warning("WebSocket thread did not terminate gracefully")
             self.ws = None
             self.ws_thread = None
+            self.ws_retries = 0
 
     def get_latest_order_book(self) -> Dict[str, List[List[float]]]:
         with self.lock:
-            if self.last_update_time > self.client.milliseconds() - 1000 and self.order_book['bids']:
+            if self.last_update_time > self.client.milliseconds() - 1000 and self.order_book['b']:
                 return self.order_book
         return self.get_order_book("BTCUSDT")
 
@@ -331,7 +341,7 @@ class BybitClient:
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
-    client = BybitClient(os.getenv('BYBIT_API_KEY'), os.getenv('BYBIT_API_SECRET'), testnet=True)
+    client = BybitClient(os.getenv('BYBIT_API_KEY'), os.getenv('API_SECRET'), testnet=True)
     client.start_websocket()
     time.sleep(10)
     print(client.get_latest_order_book())

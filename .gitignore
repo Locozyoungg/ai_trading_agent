@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+ai_trading_agent-env/
+venv/
+.env
+
+# Data files
+data/*.csv
+data/*.json
+
+# Models
+saved_models/
+models/*.h5
+models/*.keras
+
+# Reports
+reports/
+
+# Keys
+keys/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backtest output
+backtest_results/

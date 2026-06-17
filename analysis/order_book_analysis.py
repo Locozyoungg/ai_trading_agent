@@ -1,56 +1,113 @@
-import pandas as pd
+"""
+Order Book Analysis Module
+
+Analyzes order book data from BybitClient to compute trading signals.
+"""
+
 import numpy as np
-from data_pipeline.bybit_api import BybitAPI
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
 
 class OrderBookAnalysis:
     """
-    A class to analyze order book data from Bybit and compute trading signals.
+    Analyzes order book data to calculate market pressure indicators.
     """
-    def __init__(self, api: BybitAPI, symbol: str = "BTCUSDT"):
-        """
-        Initialize the OrderBookAnalysis with a BybitAPI instance and trading symbol.
 
-        Args:
-            api (BybitAPI): Instance of BybitAPI for fetching order book data.
-            symbol (str): Trading pair (e.g., "BTCUSDT"). Defaults to "BTCUSDT".
+    def __init__(self, client, symbol: str = "BTCUSDT"):
         """
-        self.api = api
+        Args:
+            client: BybitClient instance (not BybitAPI).
+            symbol: Trading pair.
+        """
+        self.client = client
         self.symbol = symbol
 
-    def calculate_order_flow_imbalance(self, levels: int = 5) -> float | None:
+    def calculate_order_flow_imbalance(self, levels: int = 5) -> Optional[float]:
         """
-        Calculates Order Flow Imbalance (OFI) to detect buying/selling pressure.
+        Calculate normalized Order Flow Imbalance from order book.
+
+        Positive = buy pressure, negative = sell pressure.
+        Range: [-1.0, 1.0]
 
         Args:
-            levels (int): Number of top bid/ask levels to consider. Defaults to 5.
+            levels: Number of top bid/ask levels to consider.
 
         Returns:
-            float | None: OFI value (positive = buy pressure, negative = sell pressure),
-                         or None if data fetch fails.
+            Normalized OFI or None if data unavailable.
         """
-        data = self.api.get_order_book(self.symbol)
+        try:
+            data = self.client.get_order_book(self.symbol)
+            if not data or 'b' not in data or 'a' not in data:
+                logger.warning("Invalid order book data for %s", self.symbol)
+                return None
 
-        if not data or 'bids' not in data or 'asks' not in data:
-            print(f"Failed to fetch order book data for {self.symbol}")
+            bids = data['b'][:levels]
+            asks = data['a'][:levels]
+
+            if not bids or not asks:
+                return None
+
+            bid_vol = sum(float(b[1]) for b in bids)
+            ask_vol = sum(float(a[1]) for a in asks)
+            total = bid_vol + ask_vol
+
+            if total == 0:
+                return 0.0
+
+            ofi = (bid_vol - ask_vol) / total
+            logger.debug("OFI=%+.4f (bid_vol=%.2f ask_vol=%.2f)", ofi, bid_vol, ask_vol)
+            return ofi
+
+        except Exception as e:
+            logger.error("OFI calculation error: %s", e, exc_info=True)
             return None
 
-        # Top N bid levels (sorted by price, descending)
-        bids = sorted(data['bids'], key=lambda x: float(x[0]), reverse=True)[:levels]
-        # Top N ask levels (sorted by price, ascending)
-        asks = sorted(data['asks'], key=lambda x: float(x[0]))[:levels]
+    def calculate_spread_pct(self) -> Optional[float]:
+        """Calculate current bid-ask spread as percentage of mid-price."""
+        try:
+            data = self.client.get_order_book(self.symbol)
+            if not data or 'b' not in data or 'a' not in data:
+                return None
+            best_bid = float(data['b'][0][0])
+            best_ask = float(data['a'][0][0])
+            if best_bid <= 0:
+                return None
+            return (best_ask - best_bid) / best_bid * 100
+        except Exception as e:
+            logger.error("Spread calc error: %s", e)
+            return None
 
-        # Calculate total volumes
-        bid_volumes = sum(float(b[1]) for b in bids)
-        ask_volumes = sum(float(a[1]) for a in asks)
+    def calculate_bid_ask_ratio(self, levels: int = 5) -> Optional[float]:
+        """Ratio of total bid volume to total ask volume (>1 = buy pressure)."""
+        try:
+            data = self.client.get_order_book(self.symbol)
+            if not data or 'b' not in data or 'a' not in data:
+                return None
+            bid_vol = sum(float(b[1]) for b in data['b'][:levels])
+            ask_vol = sum(float(a[1]) for a in data['a'][:levels])
+            if ask_vol == 0:
+                return 2.0  # extreme buy pressure
+            return bid_vol / ask_vol
+        except Exception as e:
+            logger.error("Bid/ask ratio error: %s", e)
+            return None
 
-        # Compute Order Flow Imbalance (OFI)
-        ofi = bid_volumes - ask_volumes  # Positive: Buy pressure, Negative: Sell pressure
 
-        print(f"Order Flow Imbalance for {self.symbol}: {ofi}")
-        return ofi
-
-# Example usage
 if __name__ == "__main__":
-    api = BybitAPI()  # Initialize API
-    analysis = OrderBookAnalysis(api)  # Create instance
-    ofi = analysis.calculate_order_flow_imbalance()  # Calculate OFI
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
+    from bybit_client import BybitClient
+
+    client = BybitClient(
+        os.getenv("BYBIT_API_KEY", ""),
+        os.getenv("BYBIT_API_SECRET", ""),
+        testnet=True
+    )
+    oba = OrderBookAnalysis(client, "BTCUSDT")
+    print("OFI:", oba.calculate_order_flow_imbalance())
+    print("Spread %:", oba.calculate_spread_pct())
+    print("Bid/Ask Ratio:", oba.calculate_bid_ask_ratio())

@@ -1,82 +1,124 @@
-# execution/scalping_strategy.py
-import time
-import numpy as np
-import threading
+"""
+Scalping Strategy Execution Module
+
+Captures small, rapid profits by exploiting short-term order book imbalances.
+No duplicate WebSockets — uses shared client data.
+"""
+
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
 
 class ScalpingStrategy:
-    def __init__(self, client, symbol: str = "BTCUSDT", spread: float = 0.02, size: float = 0.01, position_info=None, risk_components=None):
-        """
-        Implements an AI-powered scalping strategy.
+    """
+    Scalping strategy: takes small, quick profits from order book pressure waves.
 
+    Unlike HFT (which looks for spread opportunities), scalping focuses on
+    rapid order-book changes and small price dislocations.
+    """
+
+    def __init__(
+        self,
+        client,
+        symbol: str = "BTCUSDT",
+        spread: float = 0.0002,
+        size: float = 0.001,
+        position_info: Optional[dict] = None,
+        risk_components: Optional[dict] = None,
+        min_confidence: float = 0.4,
+    ):
+        """
         Args:
-            client: BybitClient instance for placing orders and fetching data.
-            symbol (str): Trading pair (e.g., "BTCUSDT"). Defaults to "BTCUSDT".
-            spread (float): Target bid-ask spread in percentage. Defaults to 0.02%.
-            size (float): Order size in units. Defaults to 0.01.
-            position_info: Shared position info from TradingSystem.
-            risk_components: Shared risk management components from TradingSystem.
+            client: BybitClient instance.
+            symbol: Trading pair.
+            spread: Target half-spread as fraction.
+            size: Base order size in BTC.
+            position_info: Shared position info.
+            risk_components: Shared risk components.
+            min_confidence: Minimum signal confidence to scalp.
         """
         self.client = client
         self.symbol = symbol
         self.spread = spread
-        self.size = size
-        self.running = False
-        self.thread = None
+        self.base_size = size
         self.position_info = position_info or {}
         self.risk_components = risk_components or {}
+        self.min_confidence = min_confidence
+        logger.info("ScalpingStrategy initialized for %s", symbol)
 
-    def start(self):
-        """Start the scalping strategy thread."""
-        self.running = True
-        self.thread = threading.Thread(target=self.run)
-        self.thread.daemon = True
-        self.thread.start()
-        print(f"ScalpingStrategy started for {self.symbol}")
-
-    def execute_scalping(self):
+    def execute_scalp(self) -> Optional[str]:
         """
-        Places rapid bid-ask orders to capture small profits frequently.
+        Look for a scalping opportunity.
+
+        Strategy:
+        - Check order book pressure (bid volume / ask volume ratio)
+        - If strong buy pressure and price hasn't moved yet, buy for a quick scalp
+        - If strong sell pressure and price hasn't moved yet, sell for a quick scalp
+        - Target: capture 50% of the spread
+
+        Returns:
+            'buy', 'sell', or None.
         """
-        if self.position_info.get('size', 0):  # Skip if position exists
-            return
+        if self.position_info.get('size', 0) > 0:
+            return None
 
-        book = self.client.get_order_book(self.symbol)
-        if not book or 'bids' not in book or 'asks' not in book:
-            print(f"Failed to fetch order book for {self.symbol}")
-            return
+        try:
+            book = self.client.get_order_book(self.symbol)
+            if not book or 'b' not in book or 'a' not in book:
+                return None
 
-        best_bid = float(max(book["bids"], key=lambda x: float(x[0]))[0])
-        best_ask = float(min(book["asks"], key=lambda x: float(x[0]))[0])
+            bids = book['b'][:10]
+            asks = book['a'][:10]
+            if not bids or not asks:
+                return None
 
-        bid_price = round(best_bid * (1 - self.spread / 100), 2)
-        ask_price = round(best_ask * (1 + self.spread / 100), 2)
+            bid_vol = sum(float(b[1]) for b in bids)
+            ask_vol = sum(float(a[1]) for a in asks)
+            total = bid_vol + ask_vol
 
-        self.client.place_order(self.symbol, "Buy", self.size, "Limit", price=bid_price)
-        self.client.place_order(self.symbol, "Sell", self.size, "Limit", price=ask_price)
-        print(f"✅ Scalping: BUY @ {bid_price}, SELL @ {ask_price}")
+            if total == 0:
+                return None
 
-    def run(self):
-        """
-        Runs the scalping strategy in a continuous loop.
-        """
-        while self.running:
-            self.execute_scalping()
-            time.sleep(0.5)  # Fast execution loop
+            ratio = bid_vol / ask_vol if ask_vol > 0 else 2.0
 
-    def stop(self):
-        """Stop the scalping strategy thread."""
-        self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join()
-        print(f"ScalpingStrategy stopped for {self.symbol}")
+            # Strong buy pressure (ratio > 1.5)
+            if ratio > 1.5:
+                logger.debug("Scalp BUY opportunity: bid/ask ratio=%.3f", ratio)
+                size = self.base_size
+                order = self.client.place_order(self.symbol, size, "BUY", order_type="Market")
+                if order and 'id' in order:
+                    logger.info("Scalp BUY executed: %.4f @ market", size)
+                    return "buy"
+
+            # Strong sell pressure (ratio < 0.67)
+            elif ratio < 0.67:
+                logger.debug("Scalp SELL opportunity: bid/ask ratio=%.3f", ratio)
+                size = self.base_size
+                order = self.client.place_order(self.symbol, size, "SELL", order_type="Market")
+                if order and 'id' in order:
+                    logger.info("Scalp SELL executed: %.4f @ market", size)
+                    return "sell"
+
+            return None
+
+        except Exception as e:
+            logger.error("Scalp execution error: %s", e, exc_info=True)
+            return None
+
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
     from bybit_client import BybitClient
-    client = BybitClient("YOUR_API_KEY", "YOUR_API_SECRET", testnet=True)
-    scalper = ScalpingStrategy(client)
-    scalper.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        scalper.stop()
+
+    client = BybitClient(
+        os.getenv("BYBIT_API_KEY", ""),
+        os.getenv("BYBIT_API_SECRET", ""),
+        testnet=True
+    )
+    scalper = ScalpingStrategy(client, "BTCUSDT")
+    result = scalper.execute_scalp()
+    print("Scalp result:", result)

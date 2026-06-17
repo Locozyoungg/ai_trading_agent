@@ -1,0 +1,14 @@
+2025-03-20 03:44:17,464 - strategies.trading_strategy - INFO - Loaded ensemble models
+2025-03-20 03:44:17,469 - strategies.trading_strategy - INFO - AdvancedTradingStrategy initialized with Transformer and ensemble capabilities
+2025-03-20 03:44:20,959 - strategies.trading_strategy - INFO - Loaded ensemble models
+2025-03-20 03:44:20,959 - strategies.trading_strategy - INFO - AdvancedTradingStrategy initialized with Transformer and ensemble capabilities
+2025-03-20 03:44:21,094 - strategies.trading_strategy - INFO - Loaded ensemble models
+2025-03-20 03:44:21,100 - strategies.trading_strategy - INFO - AdvancedTradingStrategy initialized with Transformer and ensemble capabilities
+2025-03-20 03:46:42,763 - strategies.trading_strategy - ERROR - Order book imbalance error: 'bids'
+2025-03-20 03:56:14,605 - strategies.trading_strategy - INFO - Loaded ensemble models
+2025-03-20 03:56:14,610 - strategies.trading_strategy - INFO - AdvancedTradingStrategy initialized with Transformer and ensemble capabilities
+2025-03-20 03:56:18,265 - strategies.trading_strategy - INFO - Loaded ensemble models
+2025-03-20 03:56:18,273 - strategies.trading_strategy - INFO - AdvancedTradingStrategy initialized with Transformer and ensemble capabilities
+2025-03-20 03:56:18,526 - strategies.trading_strategy - INFO - Loaded ensemble models
+2025-03-20 03:56:18,531 - strategies.trading_strategy - INFO - AdvancedTradingStrategy initialized with Transformer and ensemble capabilities
+2025-03-20 03:58:34,862 - strategies.trading_strategy - ERROR - Order book imbalance error: 'bids'

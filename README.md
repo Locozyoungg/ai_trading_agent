@@ -1,159 +1,318 @@
-AI Trading Agent for Bybit
+# AI Trading Agent — Bybit
 
-This project is an AI-powered trading agent designed to automate cryptocurrency trading on the Bybit platform. It leverages real-time market data, risk management techniques, and AI-driven decision-making to execute trades efficiently. The agent is modular, allowing for easy customization and extension of its features.
+An AI-powered algorithmic trading system for cryptocurrency perpetual futures on **Bybit**. Signal-driven, risk-aware, backtestable.
 
-Table of Contents
+> **Current status:** v2 — functional on testnet. Signal generator uses real technical indicators (not synthetic AI). All 7 risk management components are wired into the trade flow. Includes a historical backtester with standard metrics.
 
-Project Overview (#project-overview)
+---
 
-Key Features (#key-features)
+## Table of Contents
 
-Current Setup (#current-setup)
+- [Architecture](#architecture)
+- [Signal Generator](#signal-generator)
+- [Risk Management](#risk-management)
+- [Execution Strategies](#execution-strategies)
+- [Backtesting](#backtesting)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Project Structure](#project-structure)
+- [Development Status](#development-status)
 
-Getting Started (#getting-started)
-Prerequisites (#prerequisites)
+---
 
-Installation (#installation)
+## Architecture
 
-Configuration (#configuration)
+```
+                     ┌─────────────────────────────┐
+                     │        TradingSystem         │
+                     │      (main.py — loop)        │
+                     └──────────┬──────────────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          │                     │                     │
+          ▼                     ▼                     ▼
+   ┌──────────┐        ┌──────────────┐      ┌──────────────┐
+   │  Market  │        │ Risk Gates   │      │  Execution   │
+   │ Analysis │        │ (7 checks)   │      │  Strategies  │
+   ├──────────┤        ├──────────────┤      ├──────────────┤
+   │ OFI      │        │ Drawdown     │      │ HFT          │
+   │ MarketInsights│   │ Max Loss     │      │ Market Maker │
+   │ OrderBook│        │ Position Sizing│    │ Scalping     │
+   │ Iceberg  │        │ Stop Loss/TP │      │ Default      │
+   │ StopHunt │        │ Trailing Stop │     │              │
+   │ Timing   │        │ Leverage     │      │              │
+   └──────────┘        │ Volatility   │      └──────────────┘
+                       └──────────────┘
+                               │
+                               ▼
+                     ┌─────────────────┐
+                     │  SignalGenerator│
+                     │  (technical +   │
+                     │   regime-based) │
+                     └─────────────────┘
+```
 
-Running the Agent (#running-the-agent)
+### Data Flow
 
-Usage (#usage)
+1. **Market Analysis** — Fetches OHLCV + order book from Bybit via unified `BybitClient` (ccxt + WebSocket)
+2. **Signal Generation** — `SignalGenerator` computes RSI, MACD, Bollinger Bands, momentum, volume confirmation, and OFI; then fuses them into a combined signal with market regime detection
+3. **Risk Gates** — All 7 risk components check the proposed trade before execution. Position size adapts to volatility, win rate, and consecutive losses
+4. **Execution** — Order placed via `BybitClient`. Position monitored every cycle for SL/TP/trailing stop
+5. **Feedback** — Trade outcomes recorded back into the `SignalGenerator` for adaptive weight adjustment
 
-Troubleshooting (#troubleshooting)
+---
 
-Future Enhancements (#future-enhancements)
+## Signal Generator
 
-Contributing (#contributing)
+**File:** `ai/self_learning.py` — `SignalGenerator` class
 
-License (#license)
+Replaces the original synthetic DQN with a transparent, interpretable signal engine:
 
-Contact (#contact)
+| Indicator | Weight | Description |
+|-----------|--------|-------------|
+| RSI (14) | 20% | Relative Strength Index — overbought/oversold oscillator |
+| MACD | 20% | Moving Average Convergence Divergence histogram |
+| Bollinger Bands %b | 15% | Position within volatility bands |
+| Trend Strength | 15% | Linear regression slope normalized to [-1, 1] |
+| Volume Confirmation | 10% | Rising volume on directional moves |
+| Order Flow Imbalance | 10% | Buy vs sell pressure from order book |
+| Momentum (ROC) | 10% | Rate of change over 10 periods |
 
+### Regime Detection
 
-Project Overview
+Classifies each candle into one of four regimes:
 
-The AI Trading Agent automates cryptocurrency trading on Bybit by integrating modules for market analysis, risk management, trade execution, and performance tracking. It is designed to help traders make data-driven decisions while minimizing risk and maximizing profitability.
+- **trend_up** / **trend_down** — strong directional bias → amplify signal 20%
+- **ranging** — no clear direction → neutral weighting
+- **volatile** — high volatility → reduce confidence 50%
 
-Key Features
-Market Data Analysis:
-Real-time order book analysis and calculation of Order Flow Imbalance (OFI).
+### Adaptive Behavior
 
-Market insights for multiple symbols (e.g., BTCUSDT, ETHUSDT, XRPUSDT).
+- Tracks win rate, consecutive losses, and total trades
+- Reduces position size by 50% after 3 consecutive losses
+- Halts trading after 5 consecutive losses
+- Indicator weights adjust based on historical performance
 
-Advanced detection tools (under development) for iceberg orders and stop hunts.
+---
 
-Risk Management:
-Dynamic position sizing based on account balance and risk percentage.
+## Risk Management
 
-Automatic stop-loss, take-profit, and trailing stop-loss settings.
+All 7 risk components are initialized in `TradingSystem._init_risk()` and checked on every trade:
 
-Leverage control and max loss per trade to limit exposure.
+| Component | Gate | Behavior When Triggered |
+|-----------|------|------------------------|
+| `MaxDrawdown` | ≤15% (configurable) | Prevents new trades |
+| `MaxLossPerTrade` | Per-trade loss limit | Prevents new trades |
+| `RiskManager.check_risk()` | Volatility-adjusted | Blocks trade or reduces size |
+| `RiskManager.check_volatility()` | High volatility flag | Reduces position size 50% |
+| `StopLossTakeProfit` | 1.5% SL / 3% TP (configurable) | Closes position mid-cycle |
+| `TrailingStopLoss` | Activates at 2% profit, 1% trail | Closes position mid-cycle |
+| `PositionSizing` | Kelly-based fractional sizing | Calculates dynamic size per trade |
 
-Max drawdown monitoring to halt trading if losses exceed a threshold.
+Position sizing also incorporates a **performance factor** from the signal generator — reduced after losses, full after wins.
 
-Trade Execution:
-Supports multiple strategies: High-Frequency Trading (HFT), Market Making, and Scalping.
+---
 
-AI-driven decision-making to predict actions like "BUY," "SELL," or "HOLD."
+## Execution Strategies
 
-Self-Learning and Adaptation:
-Trains an AI model using historical trade data to improve decision-making over time.
+All strategies use **centralized data** from `BybitClient` — no duplicate WebSocket connections.
 
-Performance Tracking and Reporting:
-Real-time profit tracking and strategy performance reports.
+| Strategy | Trigger | Behavior |
+|----------|---------|----------|
+| **HFT** | Spread > 0.02% + strong order-book pressure | Single directional market order (buy or sell). Rate-limited to 1 per 5s. |
+| **Market Maker** | Low-volatility regime | Places two-sided limit orders around mid-price. Cancels stale orders each cycle. Inventory-aware (stops if net position exceeds limit). |
+| **Scalping** | Bid/ask volume ratio > 1.5 or < 0.67 | Single market order in direction of pressure. |
+| **Default** | Any regime | Uses `AdvancedTradingStrategy` ensemble signal (Transformer + XGBoost/LightGBM — still under development). |
 
-Current Setup
-The agent is configured to run on Bybit's testnet, allowing for simulated trading without risking real funds.
+Strategy selection is automatic based on the current volatility regime:
+- High volatility → HFT
+- Strong OFI → Scalping
+- Low volatility → Market Making
+- Mixed → Default (combined signal)
 
-Some features, such as the AI learning component and advanced detection tools, are still under development.
+---
 
+## Backtesting
 
-Getting Started
-Prerequisites
-Python 3.x
+**File:** `backtest.py`
 
-Bybit Testnet Account: Sign up at Bybit Testnet and generate API keys.
+```
+python backtest.py --symbol BTCUSDT --days 30
+```
 
-Dependencies:
-pybit: Bybit's official Python SDK.
+### Features
+- Uses the **same `SignalGenerator`** as live trading — signals are identical
+- Simulates fills at candle close with configurable slippage (default 2bps)
+- Reports standard metrics:
+  - Total return / Annualized return
+  - Sharpe ratio (annualized)
+  - Maximum drawdown
+  - Win rate, profit factor, avg win/loss
+- Saves trade log and equity curve to `backtest_results/` as CSV
+- Can load historical data via API (mainnet) or from a CSV file
 
-Other libraries as required (e.g., numpy, pandas, keras for AI components).
+### Options
 
-Installation
-Clone the repository:
-bash
+```
+--symbol  BTCUSDT     Trading pair
+--days    14          Days of hourly data to fetch
+--balance 1000.0      Starting balance
+--risk    0.01        Risk per trade (1%)
+--file    data.csv    Optional: load CSV instead of API
+```
 
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.8+
+- Bybit Testnet account ([sign up](https://testnet.bybit.com/))
+- API keys with trade permissions
+
+### Setup
+
+```bash
+# 1. Clone
 git clone https://github.com/yourusername/ai_trading_agent.git
 cd ai_trading_agent
 
-Install the required dependencies:
-bash
+# 2. Create virtual environment
+python -m venv venv
+source venv/bin/activate   # Linux/Mac
+venv\Scripts\activate      # Windows
 
-pip install pybit tensorflow numpy
+# 3. Install dependencies
+pip install -r requirements.txt python-dotenv
 
+# 4. Configure API keys
+cp .env.example .env
+# Edit .env with your Bybit testnet API key/secret
 
+# 5. Run a backtest first
+python backtest.py --symbol BTCUSDT --days 14
 
-Configuration
-Update the API_KEY and API_SECRET in main.py with your Bybit testnet API credentials:
-python
-
-API_KEY = 'your_testnet_api_key'
-API_SECRET = 'your_testnet_api_secret'
-
-Ensure the SYMBOL variable is set to the desired trading pair (e.g., 'BTCUSDT').
-
-Running the Agent
-Execute the main script:
-bash
-
+# 6. Start live trading (testnet)
 python main.py
+```
 
-The agent will start analyzing market conditions, executing trades, and generating reports in a loop.
+---
 
-Usage
-The agent runs continuously, checking market conditions every 10 seconds.
+## Configuration
 
-It analyzes the order book, calculates OFI, and executes trades based on its strategies and risk management rules.
+All configuration is in **`config.py`** (auto-populated from environment variables with defaults).
 
-Logs are generated to track the agent's activities, including balance checks, trade executions, and any errors.
+Key settings (override via `.env` or system environment):
 
-Troubleshooting
-No Balance in Testnet Account:
-If you see Fetched current balance: 0.0 USD, fund your Bybit testnet account with USDT via the testnet platform.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BYBIT_API_KEY` | — | Bybit API key |
+| `BYBIT_API_SECRET` | — | Bybit API secret |
+| `USE_TESTNET` | `True` | Testnet or mainnet |
+| `SYMBOL_BTC` | `BTCUSDT` | Trading pair |
+| `TRADE_SIZE_BTC` | `0.001` | Minimum trade size |
+| `MAX_POSITION_BTC` | `0.1` | Maximum position |
+| `INITIAL_BALANCE` | `1000.0` | Starting balance |
+| `RISK_PER_TRADE` | `0.01` | 1% risk per trade |
+| `MAX_DRAWDOWN` | `0.15` | 15% max drawdown |
+| `MAX_LEVERAGE` | `3` | Maximum leverage |
 
-Error Fetching Recent Trades:
-Ensure the get_recent_trades method in bybit_api.py uses the correct pybit method (get_public_trading_records).
+See `config.py` for the full list of tunable parameters.
 
-Max Drawdown Exceeded:
-This warning appears if the account balance is too low. Ensure your testnet account has sufficient funds.
+---
 
-Other API Errors:
-Check the logs for specific error messages and verify your API keys and permissions.
+## Project Structure
 
-Future Enhancements
-Fully implement the AI learning component for improved decision-making.
+```
+├── main.py                  # Trading system orchestrator (entry point)
+├── config.py                # Centralized configuration
+├── backtest.py              # Historical backtester
+├── .gitignore               # Standard Python gitignore
+├── .env.example             # API key template
+├── requirements.txt         # Python dependencies
+│
+├── bybit_client.py          # Unified API client (ccxt + WebSocket)
+├── data_pipeline/           # Alternative client (legacy)
+│   └── bybit_api.py
+│
+├── ai/
+│   └── self_learning.py     # SignalGenerator: technical indicators + regime detection
+│
+├── analysis/
+│   ├── market_analysis.py   # MarketInsights: OHLCV analysis, volatility, RSI
+│   ├── ofi_analysis.py      # Order Flow Imbalance calculator
+│   ├── order_book_analysis.py # Order book pressure indicators
+│   ├── iceberg_detector.py  # Iceberg order detection
+│   ├── stop_hunt_detector.py # Stop-hunt pattern detection
+│   └── order_timing.py      # Large order detection
+│
+├── execution/
+│   ├── hft_trading.py       # HFT strategy (spread + pressure-based)
+│   ├── market_maker.py      # Market making (two-sided with inventory mgmt)
+│   └── scalping_strategy.py # Scalping (pressure-based)
+│
+├── risk_management/
+│   ├── leverage_control.py
+│   ├── max_drawdown.py
+│   ├── max_loss.py
+│   ├── position_sizing.py
+│   ├── risk_manager.py
+│   ├── stop_loss_take_profit.py
+│   └── trailing_stop.py
+│
+├── strategies/
+│   ├── trading_strategy.py  # AdvancedTradingStrategy (Transformer + ensemble)
+│   ├── buy_strategy.py
+│   ├── sell_strategy.py
+│   └── ...
+│
+├── tracking/
+│   ├── profit_tracker.py
+│   └── strategy_report.py
+│
+├── models/
+│   └── order_book_lstm.py   # LSTM market predictor (legacy)
+│
+├── data/                    # Market data storage (gitignored)
+├── saved_models/            # Trained models (gitignored)
+├── reports/                 # Generated reports (gitignored)
+├── backtest_results/        # Backtest output (gitignored)
+│
+└── keys/                    # API key files (gitignored)
+```
 
-Integrate advanced detection tools for iceberg orders and stop hunts.
+---
 
-Switch to Bybit's mainnet for live trading with real funds.
+## Development Status
 
-Customize risk parameters, trading strategies, and symbols for optimal performance.
+| Component | Status | Notes |
+|-----------|--------|-------|
+| API Client (BybitClient) | ✅ Stable | ccxt + WebSocket, retry logic, failover |
+| Signal Generator | ✅ Stable | 6 technical indicators, regime detection, adaptive weights |
+| Risk Management | ✅ Stable | All 7 components wired and checked on every trade |
+| Market Analysis | ✅ Stable | OFI, order book, market insights, stop-hunt, timing |
+| Execution (HFT) | ✅ Functional | Directional, rate-limited, centralized data |
+| Execution (Market Making) | ✅ Functional | Order tracking, cancellation, inventory mgmt |
+| Execution (Scalping) | ✅ Functional | Pressure-based, centralized data |
+| Backtesting | ✅ Built | Same signal generator, standard metrics, CSV output |
+| AdvancedTradingStrategy | 🔧 Partial | Transformer/ensemble architecture exists but needs training data pipeline |
+| Unit Tests | 🔧 Missing | Needed for regression safety |
+| Mainnet Trading | ❌ Not ready | Requires wallet-level risk and multi-collateral support |
 
-Contributing
-Contributions are welcome! To contribute:
-Fork the repository.
+### Known Limitations
 
-Create a new branch for your feature or bugfix.
+- The `AdvancedTradingStrategy` (Transformer + XGBoost/LightGBM ensemble) has its model infrastructure set up but lacks a connected training data pipeline — its signal weight is currently null
+- Market maker's `cancel_order` depends on a method that may need verification against the live Bybit API
+- No GPU acceleration for model training (intentional — CPU inference is sufficient for the signal generator)
+- The `data_pipeline/` directory still contains the legacy `BybitAPI` class (pybit-based) — kept for reference but not used by the main system
 
-Follow the project's coding standards.
+---
 
-Submit a pull request for review.
+## License
 
-License
-This project is licensed under the MIT License (LICENSE).
-Contact
-For questions or support, please contact [collaustine27@gmail.com (mailto:collins4oloo@gmail.com)].
+MIT — see [LICENSE](LICENSE).
 
+## Contact
 
+Collins Oloo — [collaustine27@gmail.com](mailto:collaustine27@gmail.com)

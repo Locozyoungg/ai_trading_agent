@@ -1,131 +1,149 @@
-# market_insights/market_analysis.py
 """
 Market Insights Module
 
-Analyzes market data to provide trading insights using candlestick data from Bybit API
+Fetches and analyzes OHLCV market data through BybitClient to generate
+trading insights including volatility, trend direction, and support/resistance.
 """
-from __future__ import annotations
+
 import logging
-from typing import Dict, List
+import numpy as np
+from typing import Optional, Dict, List
 
-# Assuming BybitClient is imported from your bybit_client module
-from bybit_client import BybitClient
-
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 class MarketInsights:
     """
-    A class to provide market insights based on data fetched from the Bybit API.
-
-    Attributes:
-        client (BybitClient): An instance of BybitClient to interact with the API.
-        symbols (list): List of trading symbols to analyze (e.g., ['BTCUSDT', 'ETHUSDT']).
-        timeframe (str): The timeframe for candlestick data (e.g., '1m', '1h', '1d').
+    Provides market analysis based on OHLCV data fetched via BybitClient.
     """
 
-    def __init__(self, client: BybitClient, symbols: List[str], timeframe: str = '1h'):
+    def __init__(self, client, symbols: List[str], timeframe: str = "1h"):
         """
-        Initializes the MarketInsights with a BybitClient instance, list of symbols, and timeframe.
-
         Args:
-            client (BybitClient): The Bybit API client instance used to fetch market data.
-            symbols (list): List of symbols to analyze.
-            timeframe (str, optional): The candlestick timeframe. Defaults to '1h'.
+            client: BybitClient instance.
+            symbols: List of trading symbols.
+            timeframe: Candle interval (e.g. '1', '5', '15', '60', 'D').
         """
         self.client = client
         self.symbols = symbols
         self.timeframe = timeframe
 
-    def get_latest_data(self) -> Dict[str, List[Dict]]:
+    def get_latest_data(self) -> Dict[str, Optional[np.ndarray]]:
         """
-        Fetches the latest candlestick data for the specified symbols and timeframe.
+        Fetch OHLCV data as numpy arrays via BybitClient.
 
         Returns:
-            dict: A dictionary with symbols as keys and lists of candlestick data as values.
-                  Each candlestick is a dict with keys like 'open', 'high', 'low', 'close', etc.
+            dict: symbol → (N, 6) ndarray [timestamp, O, H, L, C, V] or None.
         """
-        data = {}
+        result = {}
         for symbol in self.symbols:
             try:
-                # Fetch candlestick data; limit=10 gets the last 10 periods
-                candles = self.client.get_candlestick(symbol, self.timeframe, limit=10)
-                if candles and isinstance(candles, list):
-                    data[symbol] = candles
-                    logger.info(f"Fetched {len(candles)} candles for {symbol}")
+                data = self.client.get_historical_data(
+                    symbol,
+                    interval=self.timeframe,
+                    limit=60
+                )
+                # get_historical_data returns (N,6) ndarray
+                if data is not None and len(data) > 0:
+                    result[symbol] = data
+                    logger.info("Fetched %d candles for %s", len(data), symbol)
                 else:
-                    logger.warning(f"No candlestick data returned for {symbol}")
-                    data[symbol] = []
+                    logger.warning("No OHLCV data for %s", symbol)
+                    result[symbol] = None
             except Exception as e:
-                logger.error(f"Error fetching candlestick data for {symbol}: {e}")
-                data[symbol] = []
-        return data
+                logger.error("Error fetching data for %s: %s", symbol, e)
+                result[symbol] = None
+        return result
 
     def analyze_market(self) -> Dict[str, Dict[str, float]]:
         """
-        Analyzes the market data and provides trading insights.
+        Analyze market conditions and return trade insights per symbol.
 
-        Returns:
-            dict: A dictionary with symbols as keys and analysis results as values.
-                  Each value is a dict containing:
-                  - 'entry_price': Suggested entry price (latest close).
-                  - 'stop_loss_percentage': Suggested stop-loss percentage.
-                  - 'take_profit_percentage': Suggested take-profit percentage.
-                  - 'average_close': Average closing price over the period.
+        Returns dict with keys:
+            entry_price, stop_loss_pct, take_profit_pct, avg_close,
+            volatility, trend_strength, rsi_approximation
         """
         data = self.get_latest_data()
         insights = {}
 
         for symbol, candles in data.items():
-            if candles and len(candles) > 0:
-                try:
-                    # Extract prices and convert to float
-                    closes = [float(c['close']) for c in candles]
-                    highs = [float(c['high']) for c in candles]
-                    lows = [float(c['low']) for c in candles]
-
-                    # Basic analysis
-                    average_close = sum(closes) / len(closes)
-                    latest_close = closes[0]  # Most recent candle
-                    avg_range = (sum(highs) / len(highs)) - (sum(lows) / len(lows))  # Average true range
-
-                    # Simple strategy: Buy at latest close
-                    entry_price = latest_close
-
-                    # Stop-loss: 1% below entry (adjustable)
-                    stop_loss_percentage = 1.0  # 1% loss
-                    stop_loss_price = entry_price * (1 - stop_loss_percentage / 100)
-
-                    # Take-profit: 2% above entry (adjustable, 2:1 risk-reward ratio)
-                    take_profit_percentage = 2.0  # 2% gain
-                    take_profit_price = entry_price * (1 + take_profit_percentage / 100)
-
-                    insights[symbol] = {
-                        'entry_price': entry_price,
-                        'stop_loss_percentage': stop_loss_percentage,
-                        'take_profit_percentage': take_profit_percentage,
-                        'average_close': average_close
-                    }
-                    logger.info(f"Analysis for {symbol}: Entry={entry_price}, SL={stop_loss_price}, TP={take_profit_price}")
-                except (KeyError, ValueError) as e:
-                    logger.error(f"Error analyzing data for {symbol}: {e}")
-                    insights[symbol] = {'average_close': None}
-            else:
+            if candles is None or len(candles) < 20:
                 insights[symbol] = {
-                    'entry_price': None,
-                    'stop_loss_percentage': None,
-                    'take_profit_percentage': None,
-                    'average_close': None
+                    "entry_price": None,
+                    "stop_loss_pct": None,
+                    "take_profit_pct": None,
+                    "avg_close": None,
+                    "volatility": None,
+                    "trend_strength": 0.0,
                 }
-                logger.warning(f"No valid data to analyze for {symbol}")
+                continue
+
+            try:
+                # Column layout: [timestamp, open, high, low, close, volume]
+                closes = candles[:, 4]
+                highs = candles[:, 2]
+                lows = candles[:, 3]
+                latest_close = closes[-1]
+
+                # Volatility: standard deviation of daily returns
+                returns = np.diff(closes) / closes[:-1]
+                volatility = float(np.std(returns)) if len(returns) > 0 else 0.0
+
+                # Trend strength via linear regression slope
+                x = np.arange(len(closes))
+                slope = np.polyfit(x, closes, 1)[0]
+                trend_strength = np.tanh(slope / (closes.mean() + 1e-10) * 100)
+
+                # Simple RSI approximation (14-period)
+                gains = np.where(returns > 0, returns, 0)
+                losses = np.where(returns < 0, -returns, 0)
+                avg_gain = np.mean(gains[-14:]) if len(gains) >= 14 else np.mean(gains)
+                avg_loss = np.mean(losses[-14:]) if len(losses) >= 14 else np.mean(losses)
+                rsi = 50.0
+                if avg_loss > 0:
+                    rs = avg_gain / avg_loss
+                    rsi = 100.0 - (100.0 / (1.0 + rs))
+
+                # Adaptive stop-loss based on volatility
+                atr = float(np.mean(highs[-14:] - lows[-14:])) if len(highs) >= 14 else latest_close * 0.01
+                stop_loss_pct = min(5.0, max(0.5, atr / latest_close * 100 * 1.5))
+                take_profit_pct = stop_loss_pct * 2.0  # 2:1 risk-reward
+
+                insights[symbol] = {
+                    "entry_price": float(latest_close),
+                    "stop_loss_pct": round(stop_loss_pct, 2),
+                    "take_profit_pct": round(take_profit_pct, 2),
+                    "avg_close": float(np.mean(closes)),
+                    "volatility": round(volatility * 100, 3),
+                    "trend_strength": round(trend_strength, 4),
+                    "rsi": round(rsi, 1),
+                }
+                logger.info(
+                    "Analysis %s: close=%.2f vol=%.3f%% trend=%.3f rsi=%.1f",
+                    symbol, latest_close, volatility * 100, trend_strength, rsi
+                )
+
+            except Exception as e:
+                logger.error("Analysis failed for %s: %s", symbol, e)
+                insights[symbol] = {"entry_price": None, "stop_loss_pct": None}
+
         return insights
 
+
 if __name__ == "__main__":
-    # Example usage (assuming BybitClient is available)
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
     from bybit_client import BybitClient
-    client = BybitClient("your_api_key", "your_api_secret", testnet=True)
-    symbols = ["BTCUSDT", "ETHUSDT"]
-    market_insights = MarketInsights(client, symbols, timeframe="1h")
-    insights = market_insights.analyze_market()
-    print(insights)
+
+    client = BybitClient(
+        os.getenv("BYBIT_API_KEY", ""),
+        os.getenv("BYBIT_API_SECRET", ""),
+        testnet=True
+    )
+    mi = MarketInsights(client, ["BTCUSDT", "ETHUSDT"], timeframe="60")
+    result = mi.analyze_market()
+    for sym, data in result.items():
+        print(f"\n{sym}:")
+        for k, v in data.items():
+            print(f"  {k}: {v}")

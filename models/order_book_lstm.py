@@ -3,9 +3,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense, Concatenate, Dropout, Bidirectional, Attention, GlobalAveragePooling1D
-from tensorflow.keras.layers import LayerNormalization
-from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.layers import Input, LSTM, Dense, Concatenate, Dropout, Bidirectional, Attention, GlobalAveragePooling1D, MultiHeadAttention, LayerNormalization
+from sklearn.preprocessing import RobustScaler
 import os
 import logging
 from pathlib import Path
@@ -18,24 +17,24 @@ logger = logging.getLogger(__name__)
 
 class AdvancedMarketPredictor:
     def __init__(self, model_path: str, data_path: str, seq_length: int = 50, prediction_steps: int = 5, rl_enabled: bool = True):
-        self.model_path = model_path if model_path.endswith('.weights.h5') else model_path + '.weights.h5'
+        self.model_path = model_path if model_path.endswith('.h5') else model_path + '.h5'
         self.data_path = data_path
         self.seq_length = seq_length
         self.prediction_steps = prediction_steps
         self.ohlcv_features = 5
         self.order_book_features = 100
-        self.scaler_ohlcv = MinMaxScaler(feature_range=(-1, 1))
-        self.scaler_order_book = MinMaxScaler(feature_range=(-1, 1))
+        self.scaler_ohlcv = RobustScaler()
+        self.scaler_order_book = RobustScaler()
         self.is_fitted = False
         self.model = self._build_advanced_model()
         self.rl_enabled = rl_enabled
-        self.memory = deque(maxlen=10000)  # RL experience replay
-        self.epsilon = 1.0  # Exploration rate
+        self.memory = deque(maxlen=10000)
+        self.epsilon = 1.0
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
-        self.gamma = 0.95  # Discount factor
+        self.gamma = 0.95
 
-        logger.debug(f"Initializing AdvancedMarketPredictor with model_path={self.model_path}, data_path={self.data_path}, seq_length={self.seq_length}")
+        logger.debug(f"Initializing AdvancedMarketPredictor with model_path={self.model_path}, data_path={self.data_path}")
 
         if os.path.exists(self.model_path):
             try:
@@ -43,21 +42,18 @@ class AdvancedMarketPredictor:
                 logger.info(f"Successfully loaded model weights from {self.model_path}")
             except Exception as e:
                 logger.warning(f"Failed to load weights from {self.model_path}: {str(e)}", exc_info=True)
-                logger.info("Proceeding with a fresh model.")
-        else:
-            logger.info(f"No weights found at {self.model_path}. Starting with a fresh model.")
-
         Path(data_path).parent.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Ensured data directory exists: {Path(data_path).parent}")
 
     def _build_advanced_model(self) -> Model:
-        logger.debug("Building advanced LSTM model architecture")
+        logger.debug("Building advanced model with Transformer and LSTM")
         ohlcv_input = Input(shape=(self.seq_length, self.ohlcv_features), name='ohlcv_input')
         order_book_input = Input(shape=(self.order_book_features,), name='order_book_input')
 
+        # Transformer-enhanced LSTM
         lstm_out = Bidirectional(LSTM(256, return_sequences=True))(ohlcv_input)
         lstm_out = LayerNormalization()(lstm_out)
-        lstm_out = LSTM(128, return_sequences=True)(lstm_out)
+        attn_out = MultiHeadAttention(num_heads=8, key_dim=64)(lstm_out, lstm_out)
+        lstm_out = LSTM(128, return_sequences=True)(attn_out)
         attention_out = Attention()([lstm_out, lstm_out])
         lstm_out = GlobalAveragePooling1D()(attention_out)
         lstm_out = Dropout(0.3)(lstm_out)
@@ -74,12 +70,12 @@ class AdvancedMarketPredictor:
         output = Dense(self.prediction_steps, activation='linear')(dense)
 
         model = Model(inputs=[ohlcv_input, order_book_input], outputs=output)
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005), loss='huber', metrics=['mae'])
+        model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=0.0005), loss='huber', metrics=['mae'])
         logger.info("Advanced model compiled successfully")
         return model
 
     def _preprocess_order_book(self, order_book: Dict) -> np.ndarray:
-        logger.debug(f"Preprocessing order book data: bids={len(order_book.get('b', []))}, asks={len(order_book.get('a', []))}")
+        logger.debug(f"Preprocessing order book data: bids={len(order_book.get('b', []))}")
         bids = np.array(order_book.get('b', [])[:25], dtype=float) if order_book.get('b') else np.zeros((25, 2))
         asks = np.array(order_book.get('a', [])[:25], dtype=float) if order_book.get('a') else np.zeros((25, 2))
         ob_data = np.concatenate([bids, asks]).flatten()
@@ -89,7 +85,7 @@ class AdvancedMarketPredictor:
         return ob_data[:self.order_book_features]
 
     def update_data(self, ohlcv_data: pd.DataFrame, order_book_data: Dict):
-        logger.debug(f"Updating data with OHLCV shape={ohlcv_data.shape}, order book keys={list(order_book_data.keys())}")
+        logger.debug(f"Updating data with OHLCV shape={ohlcv_data.shape}")
         try:
             required_cols = ["open", "high", "low", "close", "volume"]
             if not all(col in ohlcv_data.columns for col in required_cols):
@@ -103,15 +99,14 @@ class AdvancedMarketPredictor:
             logger.error(f"Data update failed: {str(e)}", exc_info=True)
 
     def train(self, ohlcv_data: np.ndarray, order_book_data: Dict, epochs: int = 10, batch_size: int = 32):
-        logger.debug(f"Training model with OHLCV shape={ohlcv_data.shape}, epochs={epochs}, batch_size={batch_size}")
+        logger.debug(f"Training model with OHLCV shape={ohlcv_data.shape}")
         try:
             if ohlcv_data.shape[1] != self.ohlcv_features + 1:
-                raise ValueError(f"OHLCV data shape {ohlcv_data.shape} does not match expected (*, {self.ohlcv_features + 1})")
+                raise ValueError(f"OHLCV data shape {ohlcv_data.shape} does not match expected")
             ohlcv_prices = ohlcv_data[-self.seq_length:, 1:6]
             if ohlcv_prices.shape[0] < self.seq_length:
                 pad_length = self.seq_length - ohlcv_prices.shape[0]
                 ohlcv_prices = np.pad(ohlcv_prices, ((pad_length, 0), (0, 0)), mode='edge')
-                logger.debug(f"Padded OHLCV data from {ohlcv_prices.shape[0]} to {self.seq_length} time steps")
             processed_ob = self._preprocess_order_book(order_book_data)
             if not self.is_fitted:
                 self.scaler_ohlcv.fit(ohlcv_prices)
@@ -127,10 +122,10 @@ class AdvancedMarketPredictor:
                 y,
                 epochs=epochs,
                 batch_size=batch_size,
-                verbose=1
+                verbose=0
             )
             self.model.save_weights(self.model_path)
-            logger.info(f"Model weights successfully saved to {self.model_path}")
+            logger.info(f"Model weights saved to {self.model_path}")
             return True
         except Exception as e:
             logger.error(f"Training failed: {str(e)}", exc_info=True)
@@ -141,23 +136,21 @@ class AdvancedMarketPredictor:
         closes = ohlcv_data[:, 3]
         if len(closes) < self.prediction_steps:
             padded = np.pad(closes, (0, self.prediction_steps - len(closes)), mode='edge')
-            logger.debug(f"Padded targets from {len(closes)} to {self.prediction_steps} steps")
             return padded
         return closes[-self.prediction_steps:]
 
     def predict(self, ohlcv_data: np.ndarray, order_book_data: Dict) -> Optional[np.ndarray]:
-        logger.debug(f"Predicting with OHLCV shape={ohlcv_data.shape}, order book keys={list(order_book_data.keys())}")
+        logger.debug(f"Predicting with OHLCV shape={ohlcv_data.shape}")
         try:
             if not self.is_fitted:
-                logger.warning("Model not trained yet. Prediction aborted.")
+                logger.warning("Model not trained yet")
                 return None
             if ohlcv_data.shape[1] != self.ohlcv_features + 1:
-                raise ValueError(f"OHLCV data shape {ohlcv_data.shape} does not match expected (*, {self.ohlcv_features + 1})")
+                raise ValueError(f"OHLCV data shape {ohlcv_data.shape} does not match expected")
             ohlcv_prices = ohlcv_data[-self.seq_length:, 1:6]
             if ohlcv_prices.shape[0] < self.seq_length:
                 pad_length = self.seq_length - ohlcv_prices.shape[0]
                 ohlcv_prices = np.pad(ohlcv_prices, ((pad_length, 0), (0, 0)), mode='edge')
-                logger.debug(f"Padded OHLCV data from {ohlcv_prices.shape[0]} to {self.seq_length} time steps for prediction")
             processed_ob = self._preprocess_order_book(order_book_data)
             X_ohlcv = self.scaler_ohlcv.transform(ohlcv_prices)[np.newaxis, :, :]
             X_order_book = self.scaler_order_book.transform(processed_ob.reshape(1, -1))
@@ -170,13 +163,13 @@ class AdvancedMarketPredictor:
             return None
 
     def rl_learn(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray):
-        logger.debug(f"RL learning with state shape={state[0].shape}, action={action}, reward={reward}")
+        logger.debug(f"RL learning with state shape={state[0].shape}")
         if not self.rl_enabled:
-            logger.debug("RL learning disabled. Skipping.")
+            logger.debug("RL learning disabled")
             return
         self.memory.append((state, action, reward, next_state))
         if len(self.memory) < 64:
-            logger.debug(f"Memory buffer not full yet: {len(self.memory)}/64")
+            logger.debug(f"Memory buffer not full: {len(self.memory)}/64")
             return
         batch = random.sample(self.memory, 64)
         states_ohlcv, states_ob, actions, rewards, next_states_ohlcv, next_states_ob = [], [], [], [], [], []
@@ -208,7 +201,7 @@ class AdvancedMarketPredictor:
         logger.debug(f"Selecting RL action with OHLCV shape={ohlcv_data.shape}")
         if not self.rl_enabled or random.random() < self.epsilon:
             action = random.randint(0, self.prediction_steps - 1)
-            logger.debug(f"Random action selected due to epsilon={self.epsilon}: {action}")
+            logger.debug(f"Random action selected: {action}")
             return action
         preds = self.predict(ohlcv_data, order_book_data)
         action = np.argmax(preds) if preds is not None else 0
